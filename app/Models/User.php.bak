@@ -1,0 +1,611 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\AccessPoint;
+use App\Models\Employee;
+use App\Models\Movement;
+use App\Models\QrCode;
+use App\Models\Visitor;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+
+class MovementController extends Controller
+{
+    /**
+     * Liste des mouvements.
+     */
+    public function index()
+    {
+        $movements = Movement::with([
+            'employee',
+            'visitor',
+            'accessPoint',
+        ])
+            ->latest('occurred_at')
+            ->paginate(15);
+
+        return view('movements.index', compact('movements'));
+    }
+
+    /**
+     * Formulaire de création manuelle.
+     */
+    public function create()
+    {
+        $employees = Employee::where('status', 'active')
+            ->orderBy('last_name')
+            ->orderBy('first_name')
+            ->get();
+
+        $visitors = Visitor::whereIn('status', [
+            'expected',
+            'inside',
+        ])
+            ->orderBy('last_name')
+            ->orderBy('first_name')
+            ->get();
+
+        $accessPoints = AccessPoint::where('is_active', true)
+            ->orderBy('name')
+            ->get();
+
+        return view('movements.create', compact(
+            'employees',
+            'visitors',
+            'accessPoints'
+        ));
+    }
+
+    /**
+     * Enregistrer un mouvement manuellement.
+     */
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'employee_id' => [
+                'nullable',
+                'exists:employees,id',
+            ],
+
+            'visitor_id' => [
+                'nullable',
+                'exists:visitors,id',
+            ],
+
+            'access_point_id' => [
+                'required',
+                'exists:access_points,id',
+            ],
+
+            'type' => [
+                'required',
+                'in:entry,exit',
+            ],
+
+            'method' => [
+                'required',
+                'in:qr,nfc,manual',
+            ],
+
+            'occurred_at' => [
+                'required',
+                'date',
+            ],
+
+            'notes' => [
+                'nullable',
+                'string',
+                'max:1000',
+            ],
+        ]);
+
+        /*
+         * Une seule personne doit être associée.
+         */
+        if (
+            empty($validated['employee_id']) &&
+            empty($validated['visitor_id'])
+        ) {
+            return back()
+                ->withErrors([
+                    'employee_id' =>
+                        'Veuillez sélectionner un employé ou un visiteur.',
+                ])
+                ->withInput();
+        }
+
+        if (
+            !empty($validated['employee_id']) &&
+            !empty($validated['visitor_id'])
+        ) {
+            return back()
+                ->withErrors([
+                    'employee_id' =>
+                        'Un mouvement ne peut concerner qu’une seule personne.',
+                ])
+                ->withInput();
+        }
+
+        /*
+         * Si c'est un employé,
+         * on applique les règles de pointage.
+         */
+        if (!empty($validated['employee_id'])) {
+
+            $employee = Employee::findOrFail(
+                $validated['employee_id']
+            );
+
+            if ($employee->status !== 'active') {
+                return back()
+                    ->withErrors([
+                        'employee_id' =>
+                            'Cet employé n’est pas actif.',
+                    ])
+                    ->withInput();
+            }
+
+            $occurredAt = Carbon::parse(
+                $validated['occurred_at']
+            );
+
+            $timeError = $this->validateEmployeeMovementTime(
+                $employee,
+                $validated['type'],
+                $occurredAt
+            );
+
+            if ($timeError) {
+                return back()
+                    ->withErrors([
+                        'occurred_at' => $timeError,
+                    ])
+                    ->withInput();
+            }
+
+            /*
+             * Vérifier les doublons.
+             */
+            $alreadyExists = Movement::where(
+                'employee_id',
+                $employee->id
+            )
+                ->whereDate(
+                    'occurred_at',
+                    $occurredAt->toDateString()
+                )
+                ->where(
+                    'type',
+                    $validated['type']
+                )
+                ->exists();
+
+            if ($alreadyExists) {
+                return back()
+                    ->withErrors([
+                        'employee_id' =>
+                            $validated['type'] === 'entry'
+                                ? 'Cet employé a déjà pointé son entrée aujourd’hui.'
+                                : 'Cet employé a déjà pointé sa sortie aujourd’hui.',
+                    ])
+                    ->withInput();
+            }
+
+            /*
+             * Une sortie nécessite une entrée.
+             */
+            if ($validated['type'] === 'exit') {
+
+                $hasEntry = Movement::where(
+                    'employee_id',
+                    $employee->id
+                )
+                    ->whereDate(
+                        'occurred_at',
+                        $occurredAt->toDateString()
+                    )
+                    ->where('type', 'entry')
+                    ->exists();
+
+                if (!$hasEntry) {
+                    return back()
+                        ->withErrors([
+                            'type' =>
+                                'Impossible d’enregistrer la sortie : cet employé n’a pas pointé son entrée aujourd’hui.',
+                        ])
+                        ->withInput();
+                }
+            }
+        }
+
+        /*
+         * Création du mouvement.
+         */
+        Movement::create($validated);
+
+        return redirect()
+            ->route('movements.index')
+            ->with(
+                'success',
+                $validated['type'] === 'entry'
+                    ? 'Entrée enregistrée avec succès.'
+                    : 'Sortie enregistrée avec succès.'
+            );
+    }
+
+    /**
+     * Traiter un QR Code scanné.
+     */
+    public function scan(Request $request)
+    {
+        $validated = $request->validate([
+            'token' => [
+                'required',
+                'string',
+                'max:191',
+            ],
+
+            'type' => [
+                'required',
+                'in:entry,exit',
+            ],
+
+            'access_point_id' => [
+                'nullable',
+                'exists:access_points,id',
+            ],
+        ]);
+
+        /*
+         * Recherche du QR Code.
+         */
+        $qrCode = QrCode::with([
+            'employee',
+            'visitor',
+        ])
+            ->where('token', $validated['token'])
+            ->first();
+
+        /*
+         * QR inexistant.
+         */
+        if (!$qrCode) {
+            return response()->json([
+                'success' => false,
+                'message' => 'QR Code inconnu.',
+            ], 404);
+        }
+
+        /*
+         * QR désactivé ou expiré.
+         */
+        if (!$qrCode->isValid()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Ce QR Code est désactivé ou expiré.',
+            ], 422);
+        }
+
+        /*
+         * Aucun propriétaire.
+         */
+        if (!$qrCode->employee && !$qrCode->visitor) {
+            return response()->json([
+                'success' => false,
+                'message' =>
+                    'Ce QR Code n’est associé à aucune personne.',
+            ], 422);
+        }
+
+        /*
+         * Configuration invalide.
+         */
+        if ($qrCode->employee && $qrCode->visitor) {
+            return response()->json([
+                'success' => false,
+                'message' =>
+                    'Configuration invalide du QR Code.',
+            ], 422);
+        }
+
+        /*
+         * Point d'accès.
+         */
+        $accessPointId = $validated['access_point_id'] ?? null;
+
+        if (!$accessPointId) {
+            $accessPointId = AccessPoint::where(
+                'is_active',
+                true
+            )->value('id');
+        }
+
+        if (!$accessPointId) {
+            return response()->json([
+                'success' => false,
+                'message' =>
+                    'Aucun point d’accès actif n’est configuré.',
+            ], 422);
+        }
+
+        /*
+         * ==========================================================
+         * CAS EMPLOYÉ
+         * ==========================================================
+         */
+        if ($qrCode->employee) {
+
+            $employee = $qrCode->employee;
+
+            /*
+             * Vérifier que l'employé est actif.
+             */
+            if ($employee->status !== 'active') {
+                return response()->json([
+                    'success' => false,
+                    'message' =>
+                        'Cet employé n’est pas actif.',
+                ], 422);
+            }
+
+            $now = now();
+
+            /*
+             * Vérifier les horaires.
+             */
+            $timeError = $this->validateEmployeeMovementTime(
+                $employee,
+                $validated['type'],
+                $now
+            );
+
+            if ($timeError) {
+                return response()->json([
+                    'success' => false,
+                    'message' => $timeError,
+                ], 422);
+            }
+
+            /*
+             * Vérifier les doublons.
+             */
+            $alreadyExists = Movement::where(
+                'employee_id',
+                $employee->id
+            )
+                ->whereDate(
+                    'occurred_at',
+                    $now->toDateString()
+                )
+                ->where(
+                    'type',
+                    $validated['type']
+                )
+                ->exists();
+
+            if ($alreadyExists) {
+                return response()->json([
+                    'success' => false,
+                    'message' =>
+                        $validated['type'] === 'entry'
+                            ? 'Vous avez déjà pointé votre entrée aujourd’hui.'
+                            : 'Vous avez déjà pointé votre sortie aujourd’hui.',
+                ], 422);
+            }
+
+            /*
+             * Une sortie nécessite une entrée.
+             */
+            if ($validated['type'] === 'exit') {
+
+                $hasEntry = Movement::where(
+                    'employee_id',
+                    $employee->id
+                )
+                    ->whereDate(
+                        'occurred_at',
+                        $now->toDateString()
+                    )
+                    ->where('type', 'entry')
+                    ->exists();
+
+                if (!$hasEntry) {
+                    return response()->json([
+                        'success' => false,
+                        'message' =>
+                            'Impossible de pointer la sortie : aucune entrée n’a été enregistrée aujourd’hui.',
+                    ], 422);
+                }
+            }
+
+            /*
+             * Enregistrement.
+             */
+            $movement = Movement::create([
+                'employee_id' => $employee->id,
+                'visitor_id' => null,
+                'access_point_id' => $accessPointId,
+
+                'type' => $validated['type'],
+
+                'method' => 'qr',
+
+                'occurred_at' => $now,
+
+                'device_id' => $request->header('User-Agent'),
+
+                'ip_address' => $request->ip(),
+
+                'user_agent' => $request->userAgent(),
+
+                'verification_status' => 'verified',
+
+                'anomaly_score' => 0,
+
+                'notes' =>
+                    'Pointage employé effectué par QR Code.',
+            ]);
+
+            $qrCode->markAsUsed();
+
+            return response()->json([
+                'success' => true,
+
+                'message' =>
+                    $validated['type'] === 'entry'
+                        ? 'Bonjour ' . $employee->first_name . ', votre entrée est enregistrée.'
+                        : 'Au revoir ' . $employee->first_name . ', votre sortie est enregistrée.',
+
+                'movement_id' => $movement->id,
+
+                'person' => [
+                    'type' => 'employee',
+                    'id' => $employee->id,
+                    'name' =>
+                        $employee->first_name .
+                        ' ' .
+                        $employee->last_name,
+                ],
+            ]);
+        }
+
+        /*
+         * ==========================================================
+         * CAS VISITEUR
+         * ==========================================================
+         */
+        $visitor = $qrCode->visitor;
+
+        $movement = Movement::create([
+            'employee_id' => null,
+            'visitor_id' => $visitor->id,
+            'access_point_id' => $accessPointId,
+
+            'type' => $validated['type'],
+
+            'method' => 'qr',
+
+            'occurred_at' => now(),
+
+            'device_id' => $request->header('User-Agent'),
+
+            'ip_address' => $request->ip(),
+
+            'user_agent' => $request->userAgent(),
+
+            'verification_status' => 'verified',
+
+            'anomaly_score' => 0,
+
+            'notes' =>
+                'Mouvement visiteur enregistré par scan QR.',
+        ]);
+
+        /*
+         * Marquer le QR comme utilisé.
+         */
+        $qrCode->markAsUsed();
+
+        /*
+         * Mise à jour du statut visiteur.
+         */
+        if ($validated['type'] === 'entry') {
+
+            $visitor->update([
+                'status' => 'inside',
+            ]);
+
+        } elseif ($validated['type'] === 'exit') {
+
+            $visitor->update([
+                'status' => 'completed',
+            ]);
+        }
+
+        return response()->json([
+            'success' => true,
+
+            'message' =>
+                $validated['type'] === 'entry'
+                    ? 'Entrée du visiteur enregistrée avec succès.'
+                    : 'Sortie du visiteur enregistrée avec succès.',
+
+            'movement_id' => $movement->id,
+
+            'person' => [
+                'type' => 'visitor',
+                'id' => $visitor->id,
+                'name' =>
+                    $visitor->first_name .
+                    ' ' .
+                    $visitor->last_name,
+            ],
+        ]);
+    }
+
+    /**
+     * Vérifie si un pointage employé est autorisé.
+     *
+     * Entrée :
+     * 06:00 -> 08:30
+     *
+     * Sortie :
+     * 18:00 -> 00:00
+     */
+    private function validateEmployeeMovementTime(
+        Employee $employee,
+        string $type,
+        Carbon $dateTime
+    ): ?string {
+        $time = $dateTime->format('H:i');
+
+        if ($type === 'entry') {
+
+            if ($time < '06:00') {
+                return 'Le pointage d’entrée est disponible à partir de 06:00.';
+            }
+
+            if ($time > '08:30') {
+                return 'Le pointage d’entrée est fermé. Il était possible de pointer entre 06:00 et 08:30.';
+            }
+
+            return null;
+        }
+
+        if ($type === 'exit') {
+
+            if ($time < '18:00') {
+                return 'Le pointage de sortie est disponible à partir de 18:00.';
+            }
+
+            /*
+             * De 18:00 jusqu'à 23:59:59,
+             * le pointage est accepté.
+             */
+            if ($time >= '18:00') {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Afficher un mouvement.
+     */
+    public function show(Movement $movement)
+    {
+        $movement->load([
+            'employee',
+            'visitor',
+            'accessPoint',
+            'anomaly',
+        ]);
+
+        return view(
+            'movements.show',
+            compact('movement')
+        );
+    }
+}
