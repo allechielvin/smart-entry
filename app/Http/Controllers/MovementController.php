@@ -210,7 +210,7 @@ class MovementController extends Controller
                 'type' => 'entry',
                 'method' => 'manual',
                 'occurred_at' => $now,
-                'device_id' => $request->header('User-Agent'),
+                'device_id' => substr(md5($request->userAgent() . $request->ip()), 0, 50),
                 'ip_address' => $request->ip(),
                 'user_agent' => $request->userAgent(),
                 'verification_status' => 'verified',
