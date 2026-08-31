@@ -327,7 +327,7 @@ class MovementController extends Controller
                 'type' => 'exit',
                 'method' => 'manual',
                 'occurred_at' => $now,
-                'device_id' => $request->header('User-Agent'),
+                'device_id' => $this->getDeviceId($request),
                 'ip_address' => $request->ip(),
                 'user_agent' => $request->userAgent(),
                 'verification_status' => 'verified',
@@ -899,7 +899,7 @@ class MovementController extends Controller
                             $now,
 
                         'device_id' =>
-                            $request->header('User-Agent'),
+                            $this->getDeviceId($request),
 
                         'ip_address' =>
                             $request->ip(),
@@ -1071,7 +1071,7 @@ class MovementController extends Controller
                         $now,
 
                     'device_id' =>
-                        $request->header('User-Agent'),
+                        $this->getDeviceId($request),
 
                     'ip_address' =>
                         $request->ip(),

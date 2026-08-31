@@ -9,13 +9,12 @@ use App\Models\QrCode;
 use App\Models\Visitor;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class MovementController extends Controller
 {
     /**
-     * Liste de tous les mouvements.
-     *
-     * Cette page est destinée à l'administration.
+     * Liste des mouvements.
      */
     public function index()
     {
@@ -27,21 +26,70 @@ class MovementController extends Controller
             ->latest('occurred_at')
             ->paginate(15);
 
-        return view('movements.index', compact('movements'));
+        $today = now()->toDateString();
+
+        $todayEntries = Movement::whereDate('occurred_at', $today)
+            ->where('type', 'entry')
+            ->count();
+
+        $todayExits = Movement::whereDate('occurred_at', $today)
+            ->where('type', 'exit')
+            ->count();
+
+        /*
+         * Nombre d'employés actuellement présents.
+         *
+         * On prend le dernier mouvement de chaque employé
+         * pour déterminer s'il est actuellement à l'intérieur.
+         */
+        $employeesInside = Employee::where('status', 'active')
+            ->whereHas('movements', function ($query) {
+                $query->where('type', 'entry')
+                    ->whereDate('occurred_at', today());
+            })
+            ->whereHas('movements', function ($query) {
+                $query->where('type', 'entry')
+                    ->whereDate('occurred_at', today())
+                    ->whereNotExists(function ($subQuery) {
+                        $subQuery->select(DB::raw(1))
+                            ->from('movements as exits')
+                            ->whereColumn(
+                                'exits.employee_id',
+                                'movements.employee_id'
+                            )
+                            ->whereDate(
+                                'exits.occurred_at',
+                                DB::raw('DATE(movements.occurred_at)')
+                            )
+                            ->where('exits.type', 'exit')
+                            ->whereColumn(
+                                'exits.occurred_at',
+                                '>',
+                                'movements.occurred_at'
+                            );
+                    });
+            })
+            ->count();
+
+        $visitorsInside = Visitor::where('status', 'inside')->count();
+
+        return view('movements.index', compact(
+            'movements',
+            'todayEntries',
+            'todayExits',
+            'employeesInside',
+            'visitorsInside'
+        ));
     }
 
 
     /**
-     * Tableau de pointage personnel de l'employé connecté.
+     * Pointage personnel de l'employé connecté.
      */
     public function myAttendance(Request $request)
     {
         $user = $request->user();
 
-        /*
-         * Pour l'instant cette page est destinée
-         * aux comptes associés à un employé.
-         */
         if (!$user->employee_id) {
             abort(
                 403,
@@ -49,9 +97,7 @@ class MovementController extends Controller
             );
         }
 
-        $employee = Employee::findOrFail(
-            $user->employee_id
-        );
+        $employee = Employee::findOrFail($user->employee_id);
 
         if ($employee->status !== 'active') {
             abort(
@@ -62,26 +108,14 @@ class MovementController extends Controller
 
         $today = now()->toDateString();
 
-        $entry = Movement::where(
-            'employee_id',
-            $employee->id
-        )
-            ->whereDate(
-                'occurred_at',
-                $today
-            )
+        $entry = Movement::where('employee_id', $employee->id)
+            ->whereDate('occurred_at', $today)
             ->where('type', 'entry')
             ->latest('occurred_at')
             ->first();
 
-        $exit = Movement::where(
-            'employee_id',
-            $employee->id
-        )
-            ->whereDate(
-                'occurred_at',
-                $today
-            )
+        $exit = Movement::where('employee_id', $employee->id)
+            ->whereDate('occurred_at', $today)
             ->where('type', 'exit')
             ->latest('occurred_at')
             ->first();
@@ -96,18 +130,12 @@ class MovementController extends Controller
 
 
     /**
-     * Pointer son entrée en tant qu'employé connecté.
-     *
-     * Autorisé uniquement :
-     * 06:00 -> 08:30
+     * Enregistrer l'entrée de l'employé connecté.
      */
     public function clockIn(Request $request)
     {
         $user = $request->user();
 
-        /*
-         * Vérifier que le compte est lié à un employé.
-         */
         if (!$user->employee_id) {
             return back()->withErrors([
                 'attendance' =>
@@ -115,9 +143,7 @@ class MovementController extends Controller
             ]);
         }
 
-        $employee = Employee::find(
-            $user->employee_id
-        );
+        $employee = Employee::find($user->employee_id);
 
         if (!$employee) {
             return back()->withErrors([
@@ -126,9 +152,6 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Vérifier que l'employé est actif.
-         */
         if ($employee->status !== 'active') {
             return back()->withErrors([
                 'attendance' =>
@@ -138,9 +161,6 @@ class MovementController extends Controller
 
         $now = now();
 
-        /*
-         * Vérifier l'heure.
-         */
         $timeError = $this->validateEmployeeMovementTime(
             $employee,
             'entry',
@@ -153,17 +173,11 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Vérifier si l'entrée existe déjà aujourd'hui.
-         */
         $alreadyExists = Movement::where(
             'employee_id',
             $employee->id
         )
-            ->whereDate(
-                'occurred_at',
-                $now->toDateString()
-            )
+            ->whereDate('occurred_at', $now->toDateString())
             ->where('type', 'entry')
             ->exists();
 
@@ -174,13 +188,7 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Trouver un point d'accès actif.
-         */
-        $accessPoint = AccessPoint::where(
-            'is_active',
-            true
-        )->first();
+        $accessPoint = $this->getActiveAccessPoint();
 
         if (!$accessPoint) {
             return back()->withErrors([
@@ -189,33 +197,28 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Enregistrer l'entrée.
-         */
-        Movement::create([
-            'employee_id' => $employee->id,
-            'visitor_id' => null,
-
-            'access_point_id' => $accessPoint->id,
-
-            'type' => 'entry',
-            'method' => 'manual',
-
-            'occurred_at' => $now,
-
-            'device_id' => $request->header('User-Agent'),
-
-            'ip_address' => $request->ip(),
-
-            'user_agent' => $request->userAgent(),
-
-            'verification_status' => 'verified',
-
-            'anomaly_score' => 0,
-
-            'notes' =>
-                'Pointage d’entrée effectué par l’employé connecté.',
-        ]);
+        DB::transaction(function () use (
+            $employee,
+            $accessPoint,
+            $now,
+            $request
+        ) {
+            Movement::create([
+                'employee_id' => $employee->id,
+                'visitor_id' => null,
+                'access_point_id' => $accessPoint->id,
+                'type' => 'entry',
+                'method' => 'manual',
+                'occurred_at' => $now,
+                'device_id' => substr(md5($request->userAgent() . $request->ip()), 0, 50),
+                'ip_address' => $request->ip(),
+                'user_agent' => $request->userAgent(),
+                'verification_status' => 'verified',
+                'anomaly_score' => 0,
+                'notes' =>
+                    'Pointage d’entrée effectué par l’employé connecté.',
+            ]);
+        });
 
         return redirect()
             ->route('my_attendance')
@@ -231,18 +234,12 @@ class MovementController extends Controller
 
 
     /**
-     * Pointer sa sortie en tant qu'employé connecté.
-     *
-     * Autorisé uniquement :
-     * 18:00 -> 22:00
+     * Enregistrer la sortie de l'employé connecté.
      */
     public function clockOut(Request $request)
     {
         $user = $request->user();
 
-        /*
-         * Vérifier que le compte est lié à un employé.
-         */
         if (!$user->employee_id) {
             return back()->withErrors([
                 'attendance' =>
@@ -250,9 +247,7 @@ class MovementController extends Controller
             ]);
         }
 
-        $employee = Employee::find(
-            $user->employee_id
-        );
+        $employee = Employee::find($user->employee_id);
 
         if (!$employee) {
             return back()->withErrors([
@@ -261,9 +256,6 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Vérifier que l'employé est actif.
-         */
         if ($employee->status !== 'active') {
             return back()->withErrors([
                 'attendance' =>
@@ -273,9 +265,6 @@ class MovementController extends Controller
 
         $now = now();
 
-        /*
-         * Vérifier l'heure de sortie.
-         */
         $timeError = $this->validateEmployeeMovementTime(
             $employee,
             'exit',
@@ -288,17 +277,8 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Vérifier qu'une entrée existe aujourd'hui.
-         */
-        $entry = Movement::where(
-            'employee_id',
-            $employee->id
-        )
-            ->whereDate(
-                'occurred_at',
-                $now->toDateString()
-            )
+        $entry = Movement::where('employee_id', $employee->id)
+            ->whereDate('occurred_at', $now->toDateString())
             ->where('type', 'entry')
             ->latest('occurred_at')
             ->first();
@@ -310,17 +290,11 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Vérifier si une sortie existe déjà.
-         */
         $alreadyExists = Movement::where(
             'employee_id',
             $employee->id
         )
-            ->whereDate(
-                'occurred_at',
-                $now->toDateString()
-            )
+            ->whereDate('occurred_at', $now->toDateString())
             ->where('type', 'exit')
             ->exists();
 
@@ -331,13 +305,7 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Trouver un point d'accès actif.
-         */
-        $accessPoint = AccessPoint::where(
-            'is_active',
-            true
-        )->first();
+        $accessPoint = $this->getActiveAccessPoint();
 
         if (!$accessPoint) {
             return back()->withErrors([
@@ -346,33 +314,28 @@ class MovementController extends Controller
             ]);
         }
 
-        /*
-         * Enregistrer la sortie.
-         */
-        Movement::create([
-            'employee_id' => $employee->id,
-            'visitor_id' => null,
-
-            'access_point_id' => $accessPoint->id,
-
-            'type' => 'exit',
-            'method' => 'manual',
-
-            'occurred_at' => $now,
-
-            'device_id' => $request->header('User-Agent'),
-
-            'ip_address' => $request->ip(),
-
-            'user_agent' => $request->userAgent(),
-
-            'verification_status' => 'verified',
-
-            'anomaly_score' => 0,
-
-            'notes' =>
-                'Pointage de sortie effectué par l’employé connecté.',
-        ]);
+        DB::transaction(function () use (
+            $employee,
+            $accessPoint,
+            $now,
+            $request
+        ) {
+            Movement::create([
+                'employee_id' => $employee->id,
+                'visitor_id' => null,
+                'access_point_id' => $accessPoint->id,
+                'type' => 'exit',
+                'method' => 'manual',
+                'occurred_at' => $now,
+                'device_id' => $request->header('User-Agent'),
+                'ip_address' => $request->ip(),
+                'user_agent' => $request->userAgent(),
+                'verification_status' => 'verified',
+                'anomaly_score' => 0,
+                'notes' =>
+                    'Pointage de sortie effectué par l’employé connecté.',
+            ]);
+        });
 
         return redirect()
             ->route('my_attendance')
@@ -388,14 +351,11 @@ class MovementController extends Controller
 
 
     /**
-     * Formulaire de création manuelle par l'administration.
+     * Formulaire de création manuelle.
      */
     public function create()
     {
-        $employees = Employee::where(
-            'status',
-            'active'
-        )
+        $employees = Employee::where('status', 'active')
             ->orderBy('last_name')
             ->orderBy('first_name')
             ->get();
@@ -427,7 +387,7 @@ class MovementController extends Controller
 
 
     /**
-     * Enregistrer un mouvement manuellement par l'administration.
+     * Enregistrer un mouvement manuel.
      */
     public function store(Request $request)
     {
@@ -469,9 +429,6 @@ class MovementController extends Controller
             ],
         ]);
 
-        /*
-         * Une seule personne doit être associée.
-         */
         if (
             empty($validated['employee_id']) &&
             empty($validated['visitor_id'])
@@ -496,14 +453,28 @@ class MovementController extends Controller
                 ->withInput();
         }
 
+        $accessPoint = AccessPoint::where(
+            'id',
+            $validated['access_point_id']
+        )
+            ->where('is_active', true)
+            ->first();
+
+        if (!$accessPoint) {
+            return back()
+                ->withErrors([
+                    'access_point_id' =>
+                        'Le point d’accès sélectionné est inactif ou introuvable.',
+                ])
+                ->withInput();
+        }
+
         $occurredAt = Carbon::parse(
             $validated['occurred_at']
         );
 
         /*
-         * ============================================================
          * EMPLOYÉ
-         * ============================================================
          */
         if (!empty($validated['employee_id'])) {
 
@@ -520,9 +491,6 @@ class MovementController extends Controller
                     ->withInput();
             }
 
-            /*
-             * Appliquer les horaires.
-             */
             $timeError = $this->validateEmployeeMovementTime(
                 $employee,
                 $validated['type'],
@@ -537,9 +505,6 @@ class MovementController extends Controller
                     ->withInput();
             }
 
-            /*
-             * Vérifier les doublons.
-             */
             $alreadyExists = Movement::where(
                 'employee_id',
                 $employee->id
@@ -565,9 +530,6 @@ class MovementController extends Controller
                     ->withInput();
             }
 
-            /*
-             * Une sortie nécessite une entrée.
-             */
             if ($validated['type'] === 'exit') {
 
                 $hasEntry = Movement::where(
@@ -594,9 +556,7 @@ class MovementController extends Controller
 
 
         /*
-         * ============================================================
          * VISITEUR
-         * ============================================================
          */
         if (!empty($validated['visitor_id'])) {
 
@@ -604,15 +564,9 @@ class MovementController extends Controller
                 $validated['visitor_id']
             );
 
-            /*
-             * Un visiteur ne peut entrer que s'il est attendu.
-             */
             if (
                 $validated['type'] === 'entry' &&
-                !in_array(
-                    $visitor->status,
-                    ['expected']
-                )
+                $visitor->status !== 'expected'
             ) {
                 return back()
                     ->withErrors([
@@ -622,9 +576,6 @@ class MovementController extends Controller
                     ->withInput();
             }
 
-            /*
-             * Une sortie nécessite que le visiteur soit présent.
-             */
             if (
                 $validated['type'] === 'exit' &&
                 $visitor->status !== 'inside'
@@ -637,9 +588,6 @@ class MovementController extends Controller
                     ->withInput();
             }
 
-            /*
-             * Vérifier les horaires visiteurs.
-             */
             $timeError = $this->validateVisitorMovementTime(
                 $validated['type'],
                 $occurredAt
@@ -653,9 +601,6 @@ class MovementController extends Controller
                     ->withInput();
             }
 
-            /*
-             * Vérifier les doublons visiteurs.
-             */
             $alreadyExists = Movement::where(
                 'visitor_id',
                 $visitor->id
@@ -681,9 +626,6 @@ class MovementController extends Controller
                     ->withInput();
             }
 
-            /*
-             * Une sortie visiteur nécessite une entrée.
-             */
             if ($validated['type'] === 'exit') {
 
                 $hasEntry = Movement::where(
@@ -710,32 +652,37 @@ class MovementController extends Controller
 
 
         /*
-         * Création du mouvement.
+         * CRÉATION
          */
-        Movement::create($validated);
+        DB::transaction(function () use (
+            $validated,
+            $occurredAt
+        ) {
 
-        /*
-         * Mise à jour du statut visiteur.
-         */
-        if (!empty($validated['visitor_id'])) {
+            $validated['occurred_at'] = $occurredAt;
 
-            $visitor = Visitor::find(
-                $validated['visitor_id']
-            );
+            Movement::create($validated);
 
-            if ($validated['type'] === 'entry') {
+            if (!empty($validated['visitor_id'])) {
 
-                $visitor->update([
-                    'status' => 'inside',
-                ]);
+                $visitor = Visitor::find(
+                    $validated['visitor_id']
+                );
 
-            } else {
+                if ($validated['type'] === 'entry') {
 
-                $visitor->update([
-                    'status' => 'completed',
-                ]);
+                    $visitor->update([
+                        'status' => 'inside',
+                    ]);
+
+                } else {
+
+                    $visitor->update([
+                        'status' => 'completed',
+                    ]);
+                }
             }
-        }
+        });
 
         return redirect()
             ->route('movements.index')
@@ -749,7 +696,7 @@ class MovementController extends Controller
 
 
     /**
-     * Traiter un QR Code scanné.
+     * Scanner un QR Code.
      */
     public function scan(Request $request)
     {
@@ -771,9 +718,6 @@ class MovementController extends Controller
             ],
         ]);
 
-        /*
-         * Recherche du QR Code.
-         */
         $qrCode = QrCode::with([
             'employee',
             'visitor',
@@ -791,9 +735,6 @@ class MovementController extends Controller
             ], 404);
         }
 
-        /*
-         * Vérifier si le QR est valide.
-         */
         if (!$qrCode->isValid()) {
             return response()->json([
                 'success' => false,
@@ -802,9 +743,6 @@ class MovementController extends Controller
             ], 422);
         }
 
-        /*
-         * Aucun propriétaire.
-         */
         if (
             !$qrCode->employee &&
             !$qrCode->visitor
@@ -816,9 +754,6 @@ class MovementController extends Controller
             ], 422);
         }
 
-        /*
-         * Configuration invalide.
-         */
         if (
             $qrCode->employee &&
             $qrCode->visitor
@@ -830,20 +765,25 @@ class MovementController extends Controller
             ], 422);
         }
 
-        /*
-         * Point d'accès.
-         */
         $accessPointId =
             $validated['access_point_id'] ?? null;
 
-        if (!$accessPointId) {
-            $accessPointId = AccessPoint::where(
-                'is_active',
-                true
-            )->value('id');
+        if ($accessPointId) {
+
+            $accessPoint = AccessPoint::where(
+                'id',
+                $accessPointId
+            )
+                ->where('is_active', true)
+                ->first();
+
+        } else {
+
+            $accessPoint =
+                $this->getActiveAccessPoint();
         }
 
-        if (!$accessPointId) {
+        if (!$accessPoint) {
             return response()->json([
                 'success' => false,
                 'message' =>
@@ -853,9 +793,7 @@ class MovementController extends Controller
 
 
         /*
-         * ============================================================
-         * EMPLOYÉ PAR QR
-         * ============================================================
+         * EMPLOYÉ
          */
         if ($qrCode->employee) {
 
@@ -871,9 +809,6 @@ class MovementController extends Controller
 
             $now = now();
 
-            /*
-             * Vérifier l'heure.
-             */
             $timeError =
                 $this->validateEmployeeMovementTime(
                     $employee,
@@ -888,9 +823,6 @@ class MovementController extends Controller
                 ], 422);
             }
 
-            /*
-             * Vérifier les doublons.
-             */
             $alreadyExists = Movement::where(
                 'employee_id',
                 $employee->id
@@ -915,9 +847,6 @@ class MovementController extends Controller
                 ], 422);
             }
 
-            /*
-             * Une sortie nécessite une entrée.
-             */
             if ($validated['type'] === 'exit') {
 
                 $hasEntry = Movement::where(
@@ -940,42 +869,59 @@ class MovementController extends Controller
                 }
             }
 
-            /*
-             * Enregistrer le mouvement.
-             */
-            $movement = Movement::create([
-                'employee_id' => $employee->id,
-                'visitor_id' => null,
+            $movement = DB::transaction(
+                function () use (
+                    $employee,
+                    $accessPoint,
+                    $validated,
+                    $now,
+                    $request,
+                    $qrCode
+                ) {
 
-                'access_point_id' =>
-                    $accessPointId,
+                    $movement = Movement::create([
+                        'employee_id' =>
+                            $employee->id,
 
-                'type' =>
-                    $validated['type'],
+                        'visitor_id' =>
+                            null,
 
-                'method' => 'qr',
+                        'access_point_id' =>
+                            $accessPoint->id,
 
-                'occurred_at' => $now,
+                        'type' =>
+                            $validated['type'],
 
-                'device_id' =>
-                    $request->header('User-Agent'),
+                        'method' =>
+                            'qr',
 
-                'ip_address' =>
-                    $request->ip(),
+                        'occurred_at' =>
+                            $now,
 
-                'user_agent' =>
-                    $request->userAgent(),
+                        'device_id' =>
+                            $request->header('User-Agent'),
 
-                'verification_status' =>
-                    'verified',
+                        'ip_address' =>
+                            $request->ip(),
 
-                'anomaly_score' => 0,
+                        'user_agent' =>
+                            $request->userAgent(),
 
-                'notes' =>
-                    'Pointage employé effectué par QR Code.',
-            ]);
+                        'verification_status' =>
+                            'verified',
 
-            $qrCode->markAsUsed();
+                        'anomaly_score' =>
+                            0,
+
+                        'notes' =>
+                            'Pointage employé effectué par QR Code.',
+                    ]);
+
+                    $qrCode->markAsUsed();
+
+                    return $movement;
+                }
+            );
 
             return response()->json([
                 'success' => true,
@@ -1008,18 +954,12 @@ class MovementController extends Controller
 
 
         /*
-         * ============================================================
-         * VISITEUR PAR QR
-         * ============================================================
+         * VISITEUR
          */
-
         $visitor = $qrCode->visitor;
 
         $now = now();
 
-        /*
-         * Vérifier les horaires du visiteur.
-         */
         $timeError =
             $this->validateVisitorMovementTime(
                 $validated['type'],
@@ -1033,9 +973,6 @@ class MovementController extends Controller
             ], 422);
         }
 
-        /*
-         * Vérifier le statut du visiteur.
-         */
         if (
             $validated['type'] === 'entry' &&
             $visitor->status !== 'expected'
@@ -1058,9 +995,6 @@ class MovementController extends Controller
             ], 422);
         }
 
-        /*
-         * Vérifier les doublons.
-         */
         $alreadyExists = Movement::where(
             'visitor_id',
             $visitor->id
@@ -1085,9 +1019,6 @@ class MovementController extends Controller
             ], 422);
         }
 
-        /*
-         * Une sortie nécessite une entrée.
-         */
         if ($validated['type'] === 'exit') {
 
             $hasEntry = Movement::where(
@@ -1110,60 +1041,72 @@ class MovementController extends Controller
             }
         }
 
-        /*
-         * Enregistrer le mouvement.
-         */
-        $movement = Movement::create([
-            'employee_id' => null,
+        $movement = DB::transaction(
+            function () use (
+                $visitor,
+                $accessPoint,
+                $validated,
+                $now,
+                $request,
+                $qrCode
+            ) {
 
-            'visitor_id' =>
-                $visitor->id,
+                $movement = Movement::create([
+                    'employee_id' =>
+                        null,
 
-            'access_point_id' =>
-                $accessPointId,
+                    'visitor_id' =>
+                        $visitor->id,
 
-            'type' =>
-                $validated['type'],
+                    'access_point_id' =>
+                        $accessPoint->id,
 
-            'method' => 'qr',
+                    'type' =>
+                        $validated['type'],
 
-            'occurred_at' => $now,
+                    'method' =>
+                        'qr',
 
-            'device_id' =>
-                $request->header('User-Agent'),
+                    'occurred_at' =>
+                        $now,
 
-            'ip_address' =>
-                $request->ip(),
+                    'device_id' =>
+                        $request->header('User-Agent'),
 
-            'user_agent' =>
-                $request->userAgent(),
+                    'ip_address' =>
+                        $request->ip(),
 
-            'verification_status' =>
-                'verified',
+                    'user_agent' =>
+                        $request->userAgent(),
 
-            'anomaly_score' => 0,
+                    'verification_status' =>
+                        'verified',
 
-            'notes' =>
-                'Mouvement visiteur enregistré par scan QR.',
-        ]);
+                    'anomaly_score' =>
+                        0,
 
-        $qrCode->markAsUsed();
+                    'notes' =>
+                        'Mouvement visiteur enregistré par scan QR.',
+                ]);
 
-        /*
-         * Mise à jour du statut.
-         */
-        if ($validated['type'] === 'entry') {
+                $qrCode->markAsUsed();
 
-            $visitor->update([
-                'status' => 'inside',
-            ]);
+                if ($validated['type'] === 'entry') {
 
-        } else {
+                    $visitor->update([
+                        'status' => 'inside',
+                    ]);
 
-            $visitor->update([
-                'status' => 'completed',
-            ]);
-        }
+                } else {
+
+                    $visitor->update([
+                        'status' => 'completed',
+                    ]);
+                }
+
+                return $movement;
+            }
+        );
 
         return response()->json([
             'success' => true,
@@ -1192,13 +1135,7 @@ class MovementController extends Controller
 
 
     /**
-     * Vérifie si un pointage employé est autorisé.
-     *
-     * Entrée :
-     * 06:00 -> 08:30
-     *
-     * Sortie :
-     * 18:00 -> 22:00
+     * Vérification des horaires employés.
      */
     private function validateEmployeeMovementTime(
         Employee $employee,
@@ -1208,9 +1145,6 @@ class MovementController extends Controller
 
         $time = $dateTime->format('H:i');
 
-        /*
-         * ENTRÉE
-         */
         if ($type === 'entry') {
 
             if ($time < '06:00') {
@@ -1222,13 +1156,8 @@ class MovementController extends Controller
                 return
                     'Le pointage d’entrée est fermé. Il est possible de pointer entre 06:00 et 08:30.';
             }
-
-            return null;
         }
 
-        /*
-         * SORTIE
-         */
         if ($type === 'exit') {
 
             if ($time < '18:00') {
@@ -1240,8 +1169,6 @@ class MovementController extends Controller
                 return
                     'Le pointage de sortie est fermé. Il est possible de pointer entre 18:00 et 22:00.';
             }
-
-            return null;
         }
 
         return null;
@@ -1249,13 +1176,7 @@ class MovementController extends Controller
 
 
     /**
-     * Vérifie si un pointage visiteur est autorisé.
-     *
-     * Entrée :
-     * 06:00 -> 08:30
-     *
-     * Sortie :
-     * 18:00 -> 22:00
+     * Vérification des horaires visiteurs.
      */
     private function validateVisitorMovementTime(
         string $type,
@@ -1264,9 +1185,6 @@ class MovementController extends Controller
 
         $time = $dateTime->format('H:i');
 
-        /*
-         * ENTRÉE VISITEUR
-         */
         if ($type === 'entry') {
 
             if ($time < '06:00') {
@@ -1278,13 +1196,8 @@ class MovementController extends Controller
                 return
                     'L’entrée des visiteurs est fermée. Les entrées sont autorisées entre 06:00 et 08:30.';
             }
-
-            return null;
         }
 
-        /*
-         * SORTIE VISITEUR
-         */
         if ($type === 'exit') {
 
             if ($time < '18:00') {
@@ -1296,11 +1209,23 @@ class MovementController extends Controller
                 return
                     'La sortie des visiteurs est fermée. Les sorties sont autorisées entre 18:00 et 22:00.';
             }
-
-            return null;
         }
 
         return null;
+    }
+
+
+    /**
+     * Premier point d'accès actif.
+     */
+    private function getActiveAccessPoint(): ?AccessPoint
+    {
+        return AccessPoint::where(
+            'is_active',
+            true
+        )
+            ->orderBy('id')
+            ->first();
     }
 
 
