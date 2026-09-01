@@ -1152,9 +1152,9 @@ class MovementController extends Controller
                     'Le pointage d’entrée est disponible à partir de 06:00.';
             }
 
-            if ($time > '08:30') {
+            if ($time > '09:10') {
                 return
-                    'Le pointage d’entrée est fermé. Il est possible de pointer entre 06:00 et 08:30.';
+                    'Le pointage d’entrée est fermé. Il est possible de pointer entre 06:00 et 09:10.';
             }
         }
 
@@ -1192,9 +1192,9 @@ class MovementController extends Controller
                     'L’entrée des visiteurs est disponible à partir de 06:00.';
             }
 
-            if ($time > '08:30') {
+            if ($time > '09:10') {
                 return
-                    'L’entrée des visiteurs est fermée. Les entrées sont autorisées entre 06:00 et 08:30.';
+                    'L’entrée des visiteurs est fermée. Les entrées sont autorisées entre 06:00 et 09:10.';
             }
         }
 
